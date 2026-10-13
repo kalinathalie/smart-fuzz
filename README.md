@@ -68,7 +68,10 @@ python3 smart-fuzz.py urls.txt [options]
   --dry-run      fingerprint every target, print the plan and the commands,
                  send no requests. Worth running first, always.
   --concurrency N  hosts to work on at once (default 10)
-  --rate N       requests per second per target (default 300)
+  --rate N       ceiling for requests per second per host (default 300);
+                 each host gets less if it earns less
+  --no-calibrate do not probe for a workable rate, just scale --rate by
+                 the host's latency
   --threads N    concurrent threads (default 40)
   --maxtime N    seconds per sweep (default 3600)
   --dirs-only    skip the file sweep
@@ -94,9 +97,17 @@ against one machine, which on a list full of appliances is the opposite of
 what the rate limit is for. URLs sharing a hostname go to one worker and
 run in order.
 
-**`--rate`** defaults to 300, which suits a robust application on a network
-you own. Printers, iDRACs, switches and other appliances with a web server
-fall over well below that. If the list has any of those in it, start at 50.
+**`--rate`** is a ceiling, not a setting. Each host gets the rate it earns,
+in two steps. The fingerprint request is timed, and the rate that follows is
+ten requests in flight over that latency -- 300/s for a host answering in
+20 ms, 5/s for one taking two seconds. Then a 300-word burst checks whether
+that holds: ffuf stops with "spurious errors" when connections start
+failing, and the rate halves and tries again until it sticks or the host is
+written off.
+
+That is what a separate reconnaissance run used to be for, at three hundred
+requests a host instead of a hundred and eighty thousand. Printers, iDRACs
+and switches end up at single digits without anyone having to list them.
 
 **`--keep-case`** matters on Linux, where `/Admin` and `/admin` are different
 paths. The default folds them, which is right for IIS and loses about 11,000

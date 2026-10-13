@@ -241,15 +241,20 @@ def host_of(url: str) -> str:
     return (urlsplit(url).hostname or url).lower()
 
 
-def fingerprint(url: str, timeout: int = 10) -> tuple[str, set[str]]:
-    """What the target looks like it runs, as a set of extensions.
+def fingerprint(url: str, timeout: int = 10) -> tuple[str, set[str], float]:
+    """What the target looks like it runs, and how long it took to say so.
 
     One request. Everything it can go wrong with -- TLS, timeout, a reset --
     means the universal set, which is the honest answer rather than a
     guessed stack.
+
+    The timing is free here and worth having: a box that takes two seconds
+    to answer one request is not going to take three hundred a second, and
+    starting it there only finds that out by knocking it over.
     """
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     signals: list[str] = []
+    started = time.monotonic()
     try:
         import ssl
 
@@ -265,7 +270,7 @@ def fingerprint(url: str, timeout: int = 10) -> tuple[str, set[str]]:
         for key, value in (error.headers or {}).items():
             signals.append(f"{key}: {value}".lower())
     except Exception:  # noqa: BLE001 -- unreachable is not a stack
-        return "unreachable", set(ALWAYS)
+        return "unreachable", set(ALWAYS), 0.0
 
     haystack = " ".join(signals)
     found = set(ALWAYS)
@@ -274,7 +279,74 @@ def fingerprint(url: str, timeout: int = 10) -> tuple[str, set[str]]:
         if any(marker in haystack for marker in markers):
             found.update(extensions)
             seen.append(markers[0])
-    return ("+".join(seen) or "unknown"), found
+    return ("+".join(seen) or "unknown"), found, time.monotonic() - started
+
+
+#: How many requests a host should have in flight at once. The rate that
+#: follows from it is concurrency over latency: a box answering in 50 ms
+#: takes 200 a second to keep ten in flight, one answering in two seconds
+#: takes five. It is the same politeness either way, which a fixed rate is
+#: not.
+IN_FLIGHT = 10
+
+#: Below this there is no point continuing; the host is not going to be
+#: swept today whatever we do.
+RATE_FLOOR = 5
+
+#: How many words the calibration burst spends finding out.
+PROBE_WORDS = 300
+
+
+def rate_from_latency(latency: float, ceiling: int) -> int:
+    """A first guess at what this host will take."""
+    if latency <= 0:
+        return ceiling
+    return max(RATE_FLOOR, min(ceiling, int(IN_FLIGHT / latency)))
+
+
+def calibrate(url: str, wordlist: Path, start: int, threads: int,
+              workdir: Path, dry: bool) -> int:
+    """The rate this host actually tolerates, found by asking it.
+
+    A short burst at the candidate rate. ffuf says "spurious errors" and
+    stops when connections start failing, which is the signal: halve and
+    ask again. Returns 0 when even the floor is refused -- that host is
+    not having it, and sending the full sweep would be a slower way of
+    learning the same thing.
+
+    This is what the separate --dirs-only reconnaissance run was for. It
+    costs about three hundred requests a host instead of a hundred and
+    eighty thousand.
+    """
+    if dry:
+        return start
+
+    probe = workdir / "probe.txt"
+    try:
+        sample = words(wordlist)[:PROBE_WORDS]
+        probe.write_text("\n".join(sample) + "\n", encoding="utf-8")
+    except OSError:
+        return start
+
+    rate = start
+    while rate >= RATE_FLOOR:
+        argv = [
+            "ffuf", "-u", f"{url}/FUZZ", "-w", f"{probe}:FUZZ",
+            "-mc", "all", "-fc", "404", "-ac",
+            "-t", str(threads), "-rate", str(rate), "-timeout", "10",
+            "-maxtime-job", "60",
+            "-ic", "-se", "-noninteractive", "-s",
+            "-H", f"User-Agent: {USER_AGENT}",
+        ]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True,
+                                  errors="replace")
+        except OSError:
+            return 0
+        if "spurious errors" not in (done.stdout or "") + (done.stderr or ""):
+            return rate
+        rate //= 2
+    return 0
 
 
 def words(path: Path) -> list[str]:
@@ -352,7 +424,15 @@ def build_extras(wordlists: Path, out: Path, extensions: set[str],
 
 
 def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
-          maxtime: int, dry: bool) -> None:
+          maxtime: int, dry: bool, label: str = "") -> str:
+    """One ffuf pass. Returns a one-line summary of what became of it.
+
+    ffuf's own output is captured rather than inherited. With ten workers
+    it arrives as a column of bare words -- "images", "config", "api" --
+    with nothing saying which host any of them came from, which is worse
+    than no live output at all. It goes to a log beside the results, and
+    what reaches the terminal is one attributed line per sweep.
+    """
     argv = [
         "ffuf", "-u", f"{url}/FUZZ", "-w", f"{wordlist}:FUZZ",
         # Everything except the one code that is certainly noise. Listing
@@ -367,8 +447,43 @@ def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
     ]
     if dry:
         say("      " + " ".join(argv))
-        return
-    subprocess.run(argv, check=False)
+        return "dry"
+
+    started = time.monotonic()
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace")
+    except OSError as error:
+        return f"could not run ffuf: {error}"
+    took = time.monotonic() - started
+
+    log = out.with_suffix(".log")
+    log.write_text((done.stdout or "") + (done.stderr or ""), encoding="utf-8")
+
+    noise = (done.stdout or "") + (done.stderr or "")
+    # ffuf says this and stops when connections start failing in a burst.
+    # It is the difference between "this host has nothing" and "this host
+    # would not talk to us", and the two must not read the same.
+    if "spurious errors" in noise:
+        return f"{label}refused the scan after {took:.0f}s -- lower --rate"
+
+    hits = 0
+    if out.exists():
+        try:
+            found = json.loads(out.read_text(encoding="utf-8"))
+            hits = len(found.get("results") or [])
+        except (json.JSONDecodeError, OSError):
+            hits = 0
+    return f"{label}{hits} hit(s) in {took:.0f}s"
+
+
+def _by_host(plan: list) -> dict:
+    """The plan grouped by machine, which is the unit of everything here:
+    one rate, one worker, one calibration."""
+    groups: dict[str, list] = {}
+    for item in plan:
+        groups.setdefault(host_of(item[0]), []).append(item)
+    return groups
 
 
 def main() -> int:
@@ -380,10 +495,15 @@ def main() -> int:
                              f"(default: {CACHE})")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--rate", type=int, default=300,
-                        help="requests per second per target (default: 300). "
-                             "Lower it hard if the list has appliances in it")
+                        help="ceiling for requests per second per host "
+                             "(default: 300). Each host gets less than this "
+                             "if it answers slowly or refuses the burst")
     parser.add_argument("--threads", type=int, default=40,
                         help="ffuf threads within one sweep (default: 40)")
+    parser.add_argument("--no-calibrate", action="store_true",
+                        help="do not probe each host for a rate it will "
+                             "take; use --rate scaled by its latency and "
+                             "nothing more")
     parser.add_argument("--concurrency", type=int, default=10,
                         help="how many hosts to work on at once (default: 10). "
                              "Never two sweeps against the same host: the "
@@ -424,10 +544,10 @@ def main() -> int:
     print(f"[*] {len(targets)} URL(s) across {len(groups)} host(s), "
           f"{workers} at a time")
 
-    def look(host: str) -> list[tuple[str, str, set]]:
+    def look(host: str) -> list[tuple[str, str, set, float]]:
         return [(url, *fingerprint(url)) for url in groups[host]]
 
-    seen: list[tuple[str, str, set]] = []
+    seen: list[tuple[str, str, set, float]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for found in pool.map(look, list(groups)):
             seen.extend(found)
@@ -437,41 +557,78 @@ def main() -> int:
     # single-threaded, so two workers cannot write the same file at once.
     by_stack: dict[frozenset, Path] = {}
     plan = []
-    for url, label, extensions in seen:
+    slowest: dict[str, float] = {}
+    for url, label, extensions, latency in seen:
+        # The slowest answer from a host governs it: one service on it
+        # being quick says nothing about the one that is not.
+        host = host_of(url)
+        slowest[host] = max(slowest.get(host, 0.0), latency)
         key = frozenset(extensions)
         if key not in by_stack and not args.dirs_only:
             name = out / "lists" / f"extras-{len(by_stack)}.txt"
             by_stack[key] = build_extras(args.wordlists, name, extensions, base_set)
         plan.append((url, label, by_stack.get(key)))
         extra = len(words(by_stack[key])) if key in by_stack else 0
-        print(f"    {url:<48} {label:<16} +{extra:,} file terms")
+        guess = rate_from_latency(latency, args.rate)
+        print(f"    {url:<44} {label:<14} +{extra:>6,} terms  "
+              f"{latency * 1000:>5.0f} ms -> {guess}/s")
 
     total = sum(len(words(base)) + (len(words(p)) if p else 0)
                 for _, _, p in plan)
-    # Divided by the workers: the rate is per sweep, so N hosts at once is
-    # N times the requests going out and the same wait per host.
-    hours = total / args.rate / 3600 / workers
-    print(f"[*] {total:,} requests in total, roughly "
-          f"{hours:.1f} h at {args.rate}/s across {workers} worker(s)")
+    # Per host at its own rate, then divided by the workers. Quoting the
+    # ceiling here would be a lie by a factor of twenty on an estate of
+    # slow appliances, and the estimate is the number someone decides
+    # whether to start on.
+    seconds = 0.0
+    for host, items in _by_host(plan).items():
+        rate = max(1, rate_from_latency(slowest.get(host, 0.0), args.rate))
+        n = sum(len(words(base)) + (len(words(p)) if p else 0)
+                for _, _, p in items)
+        seconds += n / rate
+    hours = seconds / 3600 / workers
+    print(f"[*] {total:,} requests in total, roughly {hours:.1f} h "
+          f"across {workers} worker(s), each host at its own rate")
 
-    by_host: dict[str, list] = {}
-    for item in plan:
-        by_host.setdefault(host_of(item[0]), []).append(item)
+    by_host = _by_host(plan)
 
     done = [0]
 
     def work(host: str) -> None:
+        # One rate for the host, found once: the latency gives a first
+        # guess and a short burst says whether it holds. This is what a
+        # separate --dirs-only run used to be for, at three hundred
+        # requests instead of a hundred and eighty thousand.
+        first = by_host[host][0][0]
+        guess = rate_from_latency(slowest.get(host, 0.0), args.rate)
+        rate = guess if args.no_calibrate else calibrate(
+            first, base, guess, args.threads, out / "lists", args.dry_run)
+        if rate == 0:
+            say(f"    {host}  refuses even {RATE_FLOOR}/s -- skipped")
+            return
+        if rate != guess:
+            say(f"    {host}  settled at {rate}/s (asked for {guess}/s)")
+
         for url, _label, extras in by_host[host]:
             slug = re.sub(r"[^A-Za-z0-9._-]", "_", url.replace("://", "_"))
             with _PRINT:
                 done[0] += 1
                 position = done[0]
             say(f"[*] {position}/{len(plan)}  {url}")
-            sweep(url, base, out / f"{slug}-dirs.json", args.rate,
-                  args.threads, args.maxtime, args.dry_run)
+            result = sweep(url, base, out / f"{slug}-dirs.json", rate,
+                           args.threads, args.maxtime, args.dry_run,
+                           label="dirs: ")
+            say(f"    {url}  {result}")
+            if "refused" in result:
+                # It would not take the directory sweep; the file sweep is
+                # the same host and the same rate, and sending it would
+                # just be a second refusal.
+                say(f"    {url}  skipping the file sweep")
+                continue
             if extras is not None:
-                sweep(url, extras, out / f"{slug}-files.json", args.rate,
-                      args.threads, args.maxtime, args.dry_run)
+                result = sweep(url, extras, out / f"{slug}-files.json",
+                               rate, args.threads, args.maxtime,
+                               args.dry_run, label="files: ")
+                say(f"    {url}  {result}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(work, list(by_host)))
