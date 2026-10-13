@@ -1,0 +1,8 @@
+# Wordlists download themselves on first run.
+wordlists/
+
+# One directory per run.
+fuzz-*/
+
+__pycache__/
+*.pyc
