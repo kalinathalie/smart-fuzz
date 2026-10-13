@@ -67,6 +67,7 @@ python3 smart-fuzz.py urls.txt [options]
 
   --dry-run      fingerprint every target, print the plan and the commands,
                  send no requests. Worth running first, always.
+  --concurrency N  hosts to work on at once (default 10)
   --rate N       requests per second per target (default 300)
   --threads N    concurrent threads (default 40)
   --maxtime N    seconds per sweep (default 3600)
@@ -84,7 +85,14 @@ http://127.0.0.1:80
 https://wiki.intranet.local:443
 ```
 
-### Two options worth thinking about
+### Three options worth thinking about
+
+**`--concurrency`** works on ten hosts at once by default. Never two sweeps
+against the same host, though: `--rate` is per sweep, so running
+`http://x:80` and `https://x:443` together would quietly double the rate
+against one machine, which on a list full of appliances is the opposite of
+what the rate limit is for. URLs sharing a hostname go to one worker and
+run in order.
 
 **`--rate`** defaults to 300, which suits a robust application on a network
 you own. Printers, iDRACs, switches and other appliances with a web server

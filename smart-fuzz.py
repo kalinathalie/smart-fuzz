@@ -35,15 +35,18 @@ directory beside this script, and are reused after that.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
@@ -217,6 +220,27 @@ def ensure_wordlists(into: Path) -> Path:
     return into
 
 
+_PRINT = threading.Lock()
+
+
+def say(line: str) -> None:
+    """Print one line, whole. Ten workers writing at once otherwise tear
+    each other's output in half."""
+    with _PRINT:
+        print(line, flush=True)
+
+
+def host_of(url: str) -> str:
+    """What counts as one machine for the purpose of not hammering it.
+
+    The hostname alone, deliberately. http://x:80 and https://x:443 are
+    usually the same service answering twice, and running both at once
+    would double the rate against it while the pool still thinks it is
+    being polite.
+    """
+    return (urlsplit(url).hostname or url).lower()
+
+
 def fingerprint(url: str, timeout: int = 10) -> tuple[str, set[str]]:
     """What the target looks like it runs, as a set of extensions.
 
@@ -342,7 +366,7 @@ def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
         "-o", str(out), "-of", "json", "-or",
     ]
     if dry:
-        print("      " + " ".join(argv))
+        say("      " + " ".join(argv))
         return
     subprocess.run(argv, check=False)
 
@@ -358,7 +382,13 @@ def main() -> int:
     parser.add_argument("--rate", type=int, default=300,
                         help="requests per second per target (default: 300). "
                              "Lower it hard if the list has appliances in it")
-    parser.add_argument("--threads", type=int, default=40)
+    parser.add_argument("--threads", type=int, default=40,
+                        help="ffuf threads within one sweep (default: 40)")
+    parser.add_argument("--concurrency", type=int, default=10,
+                        help="how many hosts to work on at once (default: 10). "
+                             "Never two sweeps against the same host: the "
+                             "rate limit is per sweep, so that would double "
+                             "it against one machine")
     parser.add_argument("--maxtime", type=int, default=3600,
                         help="seconds per sweep (default: 3600)")
     parser.add_argument("--keep-case", action="store_true",
@@ -384,13 +414,30 @@ def main() -> int:
     targets = words(args.urls)
     print(f"[*] {len(targets)} target(s), {args.rate} req/s each")
 
+    # Grouped by host from here on. Everything for one host happens in one
+    # worker, in order; different hosts go in parallel.
+    groups: dict[str, list[str]] = {}
+    for url in targets:
+        groups.setdefault(host_of(url), []).append(url.rstrip("/"))
+
+    workers = max(1, min(args.concurrency, len(groups)))
+    print(f"[*] {len(targets)} URL(s) across {len(groups)} host(s), "
+          f"{workers} at a time")
+
+    def look(host: str) -> list[tuple[str, str, set]]:
+        return [(url, *fingerprint(url)) for url in groups[host]]
+
+    seen: list[tuple[str, str, set]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for found in pool.map(look, list(groups)):
+            seen.extend(found)
+
     # One extras list per stack, not per target: hosts running the same
-    # thing get the same list, and building it is not free.
+    # thing get the same list, and building it is not free. Built here,
+    # single-threaded, so two workers cannot write the same file at once.
     by_stack: dict[frozenset, Path] = {}
     plan = []
-    for url in targets:
-        url = url.rstrip("/")
-        label, extensions = fingerprint(url)
+    for url, label, extensions in seen:
         key = frozenset(extensions)
         if key not in by_stack and not args.dirs_only:
             name = out / "lists" / f"extras-{len(by_stack)}.txt"
@@ -401,17 +448,33 @@ def main() -> int:
 
     total = sum(len(words(base)) + (len(words(p)) if p else 0)
                 for _, _, p in plan)
-    print(f"[*] {total:,} requests in total, "
-          f"roughly {total / args.rate / 3600:.1f} h at {args.rate}/s")
+    # Divided by the workers: the rate is per sweep, so N hosts at once is
+    # N times the requests going out and the same wait per host.
+    hours = total / args.rate / 3600 / workers
+    print(f"[*] {total:,} requests in total, roughly "
+          f"{hours:.1f} h at {args.rate}/s across {workers} worker(s)")
 
-    for n, (url, _label, extras) in enumerate(plan, 1):
-        slug = re.sub(r"[^A-Za-z0-9._-]", "_", url.replace("://", "_"))
-        print(f"[*] {n}/{len(plan)}  {url}")
-        sweep(url, base, out / f"{slug}-dirs.json", args.rate, args.threads,
-              args.maxtime, args.dry_run)
-        if extras is not None:
-            sweep(url, extras, out / f"{slug}-files.json", args.rate,
+    by_host: dict[str, list] = {}
+    for item in plan:
+        by_host.setdefault(host_of(item[0]), []).append(item)
+
+    done = [0]
+
+    def work(host: str) -> None:
+        for url, _label, extras in by_host[host]:
+            slug = re.sub(r"[^A-Za-z0-9._-]", "_", url.replace("://", "_"))
+            with _PRINT:
+                done[0] += 1
+                position = done[0]
+            say(f"[*] {position}/{len(plan)}  {url}")
+            sweep(url, base, out / f"{slug}-dirs.json", args.rate,
                   args.threads, args.maxtime, args.dry_run)
+            if extras is not None:
+                sweep(url, extras, out / f"{slug}-files.json", args.rate,
+                      args.threads, args.maxtime, args.dry_run)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(work, list(by_host)))
 
     print(f"[*] done. results in {out}/")
     return 0
