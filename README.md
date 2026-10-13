@@ -73,7 +73,8 @@ python3 smart-fuzz.py urls.txt [options]
   --no-calibrate do not probe for a workable rate, just scale --rate by
                  the host's latency
   --threads N    concurrent threads (default 40)
-  --maxtime N    seconds per sweep (default 3600)
+  --maxtime N    cap per sweep in seconds (default: twice what the list
+                 needs at the host's rate, plus two minutes)
   --dirs-only    skip the file sweep
   --keep-case    do not fold /Admin into /admin
   --wordlists D  use lists from D instead of downloading
@@ -98,16 +99,48 @@ what the rate limit is for. URLs sharing a hostname go to one worker and
 run in order.
 
 **`--rate`** is a ceiling, not a setting. Each host gets the rate it earns,
-in two steps. The fingerprint request is timed, and the rate that follows is
-ten requests in flight over that latency -- 300/s for a host answering in
-20 ms, 5/s for one taking two seconds. Then a 300-word burst checks whether
-that holds: ffuf stops with "spurious errors" when connections start
-failing, and the rate halves and tries again until it sticks or the host is
-written off.
+in three steps. One request is timed on a connection that is already open,
+and the rate that follows is ten requests in flight over that latency --
+300/s for a host answering in 20 ms, 5/s for one taking two seconds. The
+handshakes are left out on purpose: the sweep pays them once per
+connection, not per word, and on a VPN they are most of a cold request. A
+cold timing rated an entire /24 at 40/s once, because it was measuring the
+tunnel.
+
+Then a 300-word burst checks whether that holds. ffuf stops with "spurious
+errors" when requests start failing, and its error log says how. A host
+refusing or resetting connections is asking for less, so the rate halves
+and the burst goes again until it sticks. A host that is not answering at
+all is not asking for anything, and is written off on the first burst with
+`no answer within 10s`. The two used to read the same, and a dead host cost
+six bursts to be told "refuses even 5/s".
+
+Then the sweep itself. A host that falls over halfway -- a printer whose
+https ports cannot take the rate its http port passed calibration at --
+gets the same treatment: the rate halves, that sweep runs again, and the
+lower rate stays for the rest of the host. Refused twice, the sweep is
+reported as refused at the rate it fell at and the host keeps dropping,
+down to the floor.
+
+URLs that did not answer the fingerprint do not get swept. The plan says
+`unreachable  timed out -- skipped`, or `connection refused`, and that is
+that; sweeping them cost ninety seconds each to learn the same thing.
 
 That is what a separate reconnaissance run used to be for, at three hundred
 requests a host instead of a hundred and eighty thousand. Printers, iDRACs
 and switches end up at single digits without anyone having to list them.
+
+**`--maxtime`** is a cap, not a budget, and it is derived rather than fixed:
+twice what the list needs at the host's rate, plus two minutes. It is
+there for a host that quietly stops answering without failing outright. A
+fixed hour was the wrong unit: at 40/s the directory list needs 74 minutes,
+and on an estate rated at 40/s every sweep was cut at 81% and reported as
+`0 hit(s) in 3600s`, which looks exactly like a finished sweep. A cut sweep
+now says so, and says how much went out:
+
+```
+dirs: cut off after 3600s with roughly 144,000 of 176,699 sent, 0 hit(s) so far
+```
 
 **`--keep-case`** matters on Linux, where `/Admin` and `/admin` are different
 paths. The default folds them, which is right for IIS and loses about 11,000
@@ -121,11 +154,18 @@ fuzz-20260101-120000/
     base.txt            the merged directory list, built once
     extras-0.txt        one per distinct stack, not per target
   http_10.0.0.20_8080-dirs.json
+  http_10.0.0.20_8080-dirs.log
+  http_10.0.0.20_8080-dirs.errors
   http_10.0.0.20_8080-files.json
+  http_10.0.0.20_8080-files.log
 ```
 
-ffuf's own JSON, one file per sweep. Nothing is written for a sweep that
-found nothing.
+ffuf's own JSON, one file per sweep; nothing is written for a sweep that
+found nothing. The `.log` is what ffuf said on the way out, which is how
+you tell a cut sweep from a finished one after the fact. The `.errors` is
+one line per failed request with the reason, kept only when something
+failed -- it is the evidence behind `refused` and `no answer`, and the
+file to read when either looks wrong.
 
 ## Wordlists
 
