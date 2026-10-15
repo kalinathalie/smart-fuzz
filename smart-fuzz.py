@@ -780,6 +780,7 @@ def gather(out: Path) -> tuple[list[dict], dict, list[dict]]:
     targets: dict[str, dict] = {}
     sweeps: dict[tuple, dict] = {}
     written_off: dict[str, str] = {}
+    known: dict[str, dict] = {}     # url -> what --recheck found out about it
     journal = out / "run.jsonl"
     if journal.is_file():
         for line in journal.read_text(encoding="utf-8").splitlines():
@@ -794,6 +795,8 @@ def gather(out: Path) -> tuple[list[dict], dict, list[dict]]:
                 sweeps[(record["url"], record["kind"])] = record
             elif event == "host" and record.get("skipped"):
                 written_off[record["host"]] = record["note"]
+            elif event == "hit":
+                known[record["url"]] = record
     by_slug = {t["slug"]: t["url"] for t in targets.values()}
 
     # The lists each sweep drew from, to tell a hit from calibration noise
@@ -830,6 +833,13 @@ def gather(out: Path) -> tuple[list[dict], dict, list[dict]]:
             results = [{"target": url, "word": w, "status": 0, "url": f"{url}/{w}",
                         "host": host_of(url), "length": 0, "type": "",
                         "redirect": ""} for w in printed(out / f"{stem}-{kind}.log")]
+            for result in results:
+                seen = known.get(result["url"])
+                if seen:
+                    result.update(status=int(seen.get("status") or 0),
+                                  length=int(seen.get("length") or 0),
+                                  type=seen.get("type") or "",
+                                  redirect=seen.get("redirect") or "")
         pool: set = base
         if kind == "files" and extras:
             pool = max(extras, key=lambda s: sum(r["word"] in s for r in results))
@@ -1107,6 +1117,84 @@ def report(out: Path) -> Path:
     return path
 
 
+def ask(url: str, timeout: int = 10) -> "dict | None":
+    """One GET, redirects not followed, and what came back: the four
+    fields the JSON would have carried. None when nothing came back."""
+    parts = urlsplit(url)
+    host = parts.hostname or url
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    try:
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(host, parts.port or 443,
+                                               timeout=timeout, context=_tls())
+        else:
+            conn = http.client.HTTPConnection(host, parts.port or 80, timeout=timeout)
+        conn.request("GET", path, headers={"User-Agent": USER_AGENT})
+        response = conn.getresponse()
+        body = response.read(4_000_000)
+        length = response.getheader("Content-Length")
+        found = {
+            "status": response.status,
+            "length": int(length) if length and length.isdigit() else len(body),
+            "type": (response.getheader("Content-Type") or "").split(";")[0].strip(),
+            "redirect": response.getheader("Location") or "",
+        }
+        conn.close()
+        return found
+    except Exception:  # noqa: BLE001 -- it stays "?" and can be asked again
+        return None
+
+
+def recheck(out: Path, ceiling: int) -> tuple[int, int]:
+    """Ask each hit that has no status code for one, and write it down.
+
+    For a directory from a run whose ffuf never wrote its JSON, the words
+    are known and the codes are not; this fills them in at one request a
+    path instead of a sweep a target. One request in flight per host, the
+    rate capped as a sweep's would be. Answers go in the journal as hit
+    events, and the next report reads them. Whatever does not answer
+    stays "?" and is asked again next time.
+    """
+    _, _, hits = gather(out)
+    pending: dict[str, list[dict]] = {}
+    for hit in hits:
+        if hit["status"] == 0:
+            pending.setdefault(hit["host"], []).append(hit)
+    total = sum(len(v) for v in pending.values())
+    if not total:
+        print("[*] nothing to recheck: every hit has a status")
+        return 0, 0
+    print(f"[*] {total} path(s) without a status on {len(pending)} host(s)")
+    journal = Journal(out / "run.jsonl")
+    answered = [0]
+
+    def work(host: str) -> None:
+        mine = pending[host]
+        try:
+            latency = warm_latency(mine[0]["target"])
+        except Exception:  # noqa: BLE001
+            latency = 0.0
+        rate = rate_from_latency(latency, ceiling)
+        got = 0
+        for hit in mine:
+            started = time.monotonic()
+            found = ask(hit["url"])
+            if found:
+                journal.add(event="hit", url=hit["url"], **found)
+                got += 1
+            time.sleep(max(0.0, 1 / rate - (time.monotonic() - started)))
+        with _PRINT:
+            answered[0] += got
+        say(f"    {host:<24} {got}/{len(mine)} answered at {rate}/s")
+
+    workers = max(1, min(10, len(pending)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(work, list(pending)))
+    return answered[0], total
+
+
 def _by_host(plan: list) -> dict:
     """The plan grouped by machine, which is the unit of everything here:
     one rate, one worker, one calibration."""
@@ -1125,6 +1213,10 @@ def main() -> int:
                         help="build DIR/report.html from an output directory "
                              "that already exists, finished or still running, "
                              "and exit. Sends nothing")
+    parser.add_argument("--recheck", type=Path, metavar="DIR",
+                        help="ask every hit in DIR that has no status code for "
+                             "one, a single request each, then rebuild the "
+                             "report and exit. No sweep is repeated")
     parser.add_argument("--wordlists", type=Path, default=CACHE,
                         help=f"where the lists live; downloaded on first run "
                              f"(default: {CACHE})")
@@ -1161,8 +1253,16 @@ def main() -> int:
             return print(f"can't find {args.generate}") or 2
         print(f"[*] report at {report(args.generate)}")
         return 0
+    if args.recheck:
+        if not args.recheck.is_dir():
+            return print(f"can't find {args.recheck}") or 2
+        got, asked = recheck(args.recheck, args.rate)
+        if asked:
+            print(f"[*] {got} of {asked} answered")
+        print(f"[*] report at {report(args.recheck)}")
+        return 0
     if args.urls is None:
-        parser.error("urls is required unless --generate is given")
+        parser.error("urls is required unless --generate or --recheck is given")
     if not args.dry_run and shutil.which("ffuf") is None:
         return print("ffuf is not on PATH") or 1
     if not args.urls.is_file():

@@ -81,6 +81,8 @@ python3 smart-fuzz.py urls.txt [options]
   --out D        where results go (default: fuzz-<timestamp>/)
   --generate D   build D/report.html from an output directory that already
                  exists, finished or still running, and exit. Sends nothing.
+  --recheck D    ask every hit in D that has no status code for one, a
+                 single request each, then rebuild the report and exit.
 ```
 
 `urls.txt` is `httpx` output: one absolute URL per line, scheme and port
@@ -183,7 +185,10 @@ the journal it is built from; without one, the same is pieced together
 from the files below. Hits from a run made with ffuf older than 2.2 come
 back with status `?`: that ffuf printed each hit and then, given `-or`,
 never wrote the JSON. The words survived on stdout in the `.log`; the
-status codes did not. `-or` is no longer passed for that reason.
+status codes did not. `-or` is no longer passed for that reason, and
+`--recheck DIR` fills the codes in after the fact: one request per `?`
+path, one in flight per host, written to the journal and read by the
+next report. Nothing is swept again.
 
 The rest is evidence. ffuf's own JSON, one file per sweep. The `.log` is what ffuf said on the way out, which is how
 you tell a cut sweep from a finished one after the fact. The `.errors` is
