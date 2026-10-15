@@ -27,9 +27,12 @@ Wordlists are prepared once and cached, not per target.
 
 Usage:
     python3 smart-fuzz.py urls.txt
+    python3 smart-fuzz.py --generate fuzz-20260101-120000/
 
 The wordlists download themselves on the first run, into a wordlists/
-directory beside this script, and are reused after that.
+directory beside this script, and are reused after that. Every run ends
+with a report.html over its output directory; --generate builds the same
+report from a directory that already exists, without sending anything.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import html
 import http.client
 import json
 import re
@@ -232,6 +236,28 @@ def say(line: str) -> None:
     each other's output in half."""
     with _PRINT:
         print(line, flush=True)
+
+
+class Journal:
+    """Everything the terminal was told, one JSON object per line.
+
+    The terminal is the only place a run used to explain itself: which
+    targets were skipped and why, which sweeps were cut or refused, at
+    what rate. Once it scrolled off, the directory was a pile of files
+    with no story. This is the story, appended as it happens, and the
+    report is built from it. A path of None writes nothing (--dry-run).
+    """
+
+    def __init__(self, path: "Path | None") -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    def add(self, **fields) -> None:
+        if self.path is None:
+            return
+        line = json.dumps(fields, ensure_ascii=False)
+        with self.lock, self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
 
 
 def host_of(url: str) -> str:
@@ -603,7 +629,11 @@ def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
         "-maxtime-job", str(time_cap(total, rate, maxtime)),
         "-ic", "-se", "-noninteractive", "-s",
         "-H", f"User-Agent: {USER_AGENT}",
-        "-o", str(out), "-of", "json", "-or",
+        # No -or. It asks ffuf to skip the file when nothing hit, and every
+        # ffuf before 2.2 took it as "skip the file", full stop: a run of
+        # fifty-nine targets came back with its hits on stdout only and not
+        # one JSON on disk. An empty results file costs nothing.
+        "-o", str(out), "-of", "json",
         # One line per failed request, with the reason. Empty on a good day.
         "-debug-log", str(errors),
     ]
@@ -621,7 +651,6 @@ def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
     took = time.monotonic() - started
 
     noise = (done.stdout or "") + (done.stderr or "")
-    out.with_suffix(".log").write_text(noise, encoding="utf-8")
     why = why_failed(errors)
     tidy(errors)
 
@@ -636,19 +665,446 @@ def sweep(url: str, wordlist: Path, out: Path, rate: int, threads: int,
     # ffuf says this and stops when requests start failing in a burst.
     if "spurious errors" in noise:
         if why == "timeout":
-            return Outcome("timeout", f"{label}no answer within 15s, "
-                                      f"gave up after {took:.0f}s", hits)
-        return Outcome("refused", f"{label}refused at {rate}/s "
-                                  f"after {took:.0f}s", hits)
+            outcome = Outcome("timeout", f"{label}no answer within 15s, "
+                                         f"gave up after {took:.0f}s", hits)
+        else:
+            outcome = Outcome("refused", f"{label}refused at {rate}/s "
+                                         f"after {took:.0f}s", hits)
     # And this, only on stderr and only in the log, when the cap hits. It
     # read as "0 hit(s) in 3600s" for thirty sweeps running before anyone
     # noticed none of them had finished.
-    if "Maximum running time" in noise:
+    elif "Maximum running time" in noise:
         sent = min(total, int(rate * took))
-        return Outcome("cut", f"{label}cut off after {took:.0f}s with roughly "
-                              f"{sent:,} of {total:,} sent, "
-                              f"{hits} hit(s) so far", hits)
-    return Outcome("ok", f"{label}{hits} hit(s) in {took:.0f}s", hits)
+        outcome = Outcome("cut", f"{label}cut off after {took:.0f}s with "
+                                 f"roughly {sent:,} of {total:,} sent, "
+                                 f"{hits} hit(s) so far", hits)
+    else:
+        outcome = Outcome("ok", f"{label}{hits} hit(s) in {took:.0f}s", hits)
+
+    # The summary goes in first, above ffuf's own words, so a report built
+    # later reads the same line the terminal did.
+    out.with_suffix(".log").write_text(outcome.summary + "\n" + noise,
+                                       encoding="utf-8")
+    return outcome
+
+
+#: One HTML file over an output directory. Self-contained: no stylesheet,
+#: script or font fetched from anywhere, so it opens on the box the scan
+#: ran from. Built from the journal when there is one, and pieced together
+#: from the files when there is not.
+
+def unslug(stem: str) -> str:
+    """Back from a result filename to a URL, for directories written
+    before the journal existed. Exact for scheme://host[:port], which is
+    what httpx hands over; a path in the URL comes back with its slashes
+    as underscores, and that is as good as it gets."""
+    match = re.match(r"^(https?)_(.+?)(?:_(\d{1,5}))?$", stem)
+    if not match:
+        return stem
+    scheme, host, port = match.groups()
+    return f"{scheme}://{host}" + (f":{port}" if port else "")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def outcome_of(log: Path, errors: Path, kind: str, hits: int) -> "dict | None":
+    """What became of one sweep, read back from its log.
+
+    New logs start with the summary line the terminal got. Older ones
+    hold only ffuf's parting words, and those still say whether the cap
+    hit or the host stopped answering; the error log, when kept, says
+    which of the two the latter was.
+    """
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    first = text.split("\n", 1)[0]
+    if first.startswith(f"{kind}: "):
+        summary = first[len(kind) + 2:]
+        status = ("cut" if summary.startswith("cut off") else
+                  "refused" if summary.startswith("refused") else
+                  "timeout" if summary.startswith("no answer") else "ok")
+        return {"status": status, "summary": summary, "hits": hits}
+    if "Maximum running time" in text:
+        return {"status": "cut", "hits": hits,
+                "summary": f"cut off by the time cap, {hits} hit(s) so far"}
+    if "spurious errors" in text:
+        if why_failed(errors) == "timeout":
+            return {"status": "timeout", "hits": hits, "summary": "no answer"}
+        return {"status": "refused", "hits": hits, "summary": "refused"}
+    return {"status": "ok", "hits": hits, "summary": f"{hits} hit(s)"}
+
+
+#: ffuf's parting words, which end the stdout part of a sweep's log.
+NOTICES = ("No results and -or defined", "Receiving spurious errors",
+           "Maximum running time", "Encountered an error")
+
+#: Above this share of the list answering something other than 404, the
+#: host is answering everything, and listing it would be listing the
+#: wordlist. One such host put 123,556 "hits" in a log.
+CATCHALL = 0.1
+
+
+def printed(log: Path) -> list[str]:
+    """What ffuf printed to stdout in silent mode: the matched words, one a
+    line, before its parting notice.
+
+    ffuf before 2.2 never wrote the JSON when -or was given, whatever hit,
+    and for runs made with it this is the only record of what did. The
+    status codes went with the JSON; the words did not.
+    """
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    found = []
+    for line in text.splitlines():
+        if line.startswith(("dirs: ", "files: ")):
+            continue
+        if line.startswith(NOTICES):
+            break
+        if line:
+            found.append(line)
+    return found
+
+
+def gather(out: Path) -> tuple[list[dict], dict, list[dict]]:
+    """What happened in one output directory: the targets in order, what
+    became of each sweep, and every hit."""
+    targets: dict[str, dict] = {}
+    sweeps: dict[tuple, dict] = {}
+    written_off: dict[str, str] = {}
+    journal = out / "run.jsonl"
+    if journal.is_file():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = record.get("event")
+            if event == "target":
+                targets[record["url"]] = record
+            elif event == "sweep":
+                sweeps[(record["url"], record["kind"])] = record
+            elif event == "host" and record.get("skipped"):
+                written_off[record["host"]] = record["note"]
+    by_slug = {t["slug"]: t["url"] for t in targets.values()}
+
+    # The lists each sweep drew from, to tell a hit from calibration noise
+    # and a host with findings from a host answering everything.
+    base = set(words(out / "lists" / "base.txt"))
+    extras = [set(words(p)) for p in sorted((out / "lists").glob("extras-*.txt"))]
+
+    hits: list[dict] = []
+    stems = {(p.stem.rsplit("-", 1)[0], p.stem.rsplit("-", 1)[1])
+             for p in out.iterdir()
+             if p.is_file() and p.suffix in (".json", ".log", ".errors")
+             and p.stem.endswith(("-dirs", "-files"))}
+    for stem, kind in sorted(stems):
+        found = read_json(out / f"{stem}-{kind}.json")
+        url = by_slug.get(stem)
+        if url is None:
+            url = (found.get("config") or {}).get("url", "").replace("/FUZZ", "")
+            url = url or unslug(stem)
+            targets.setdefault(url, {"url": url, "slug": stem, "stack": "",
+                                     "skipped": ""})
+
+        if found:
+            results = [{
+                "target": url,
+                "word": (hit.get("input") or {}).get("FUZZ", ""),
+                "status": int(hit.get("status") or 0),
+                "url": hit.get("url") or f"{url}/{(hit.get('input') or {}).get('FUZZ', '')}",
+                "host": hit.get("host") or host_of(url),
+                "length": int(hit.get("length") or 0),
+                "type": (hit.get("content-type") or "").split(";")[0].strip(),
+                "redirect": hit.get("redirectlocation") or "",
+            } for hit in found.get("results") or []]
+        else:
+            results = [{"target": url, "word": w, "status": 0, "url": f"{url}/{w}",
+                        "host": host_of(url), "length": 0, "type": "",
+                        "redirect": ""} for w in printed(out / f"{stem}-{kind}.log")]
+        pool: set = base
+        if kind == "files" and extras:
+            pool = max(extras, key=lambda s: sum(r["word"] in s for r in results))
+        if pool and not found:
+            results = [r for r in results if r["word"] in pool]
+
+        if (url, kind) not in sweeps:
+            seen = outcome_of(out / f"{stem}-{kind}.log",
+                              out / f"{stem}-{kind}.errors", kind, len(results))
+            if seen is not None:
+                sweeps[(url, kind)] = seen
+        if pool and len(results) > CATCHALL * len(pool):
+            seen = sweeps.setdefault((url, kind), {"status": "ok", "summary": "",
+                                                   "hits": len(results)})
+            seen["summary"] = (f"catch-all: {len(results):,} of {len(pool):,} "
+                               f"words answered, not listed")
+            continue
+        hits.extend(results)
+
+    for url, target in targets.items():
+        note = written_off.get(host_of(url))
+        if note and (url, "dirs") not in sweeps and not target.get("skipped"):
+            target["skipped"] = note
+    hits.sort(key=lambda h: (h["status"], h["host"], h["url"]))
+    return list(targets.values()), sweeps, hits
+
+
+REPORT_STYLE = r"""
+:root{color-scheme:light;--page:#f9f9f7;--card:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--mute:#898781;
+--line:#e1e0d9;--ring:rgba(11,11,11,.10);--on:#0b0b0b;--onfg:#fcfcfb;--link:#1c5cab;
+--c2:#1baf7a;--c3:#2a78d6;--c4:#eb6834;--c5:#6250d6;--c0:#898781}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--page:#0d0d0d;--card:#1a1a19;--ink:#f0efec;
+--ink2:#c3c2b7;--mute:#898781;--line:#2c2c2a;--ring:rgba(255,255,255,.10);--on:#f0efec;--onfg:#1a1a19;
+--link:#86b6ef;--c2:#199e70;--c3:#3987e5;--c4:#d95926;--c5:#9085e9;--c0:#898781}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.top{padding:20px 24px 14px;border-bottom:1px solid var(--line);background:var(--card)}
+.brand{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+h1{font-size:20px;font-weight:650;margin:2px 0 16px}
+.tiles{display:flex;flex-wrap:wrap;gap:28px;margin-bottom:16px}
+.tile .v{display:block;font-size:24px;font-weight:650;line-height:1.1}
+.tile .l{font-size:12px;color:var(--ink2)}
+nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+nav button{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
+padding:3px 10px;border-radius:999px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+nav button b{font-weight:600;color:var(--ink2)}
+nav button.on{background:var(--on);color:var(--onfg);border-color:var(--on)}nav button.on b{color:inherit}
+nav input{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
+padding:4px 10px;border-radius:999px;margin-left:auto;min-width:220px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.c2{background:var(--c2)}.c3{background:var(--c3)}.c4{background:var(--c4)}.c5{background:var(--c5)}.c0{background:var(--c0)}
+.note{margin:10px 0 0;font-size:12.5px;color:var(--ink2)}
+.layout{display:grid;grid-template-columns:240px 1fr;gap:28px;padding:20px 24px;align-items:start}
+aside{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;font-size:13px}
+aside .hd{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);margin:0 0 6px 8px}
+aside a{display:grid;grid-template-columns:1fr auto;gap:3px 8px;padding:6px 8px;border-radius:8px;color:var(--ink)}
+aside a:hover{background:var(--card);text-decoration:none}
+aside a .n{color:var(--ink2);font-variant-numeric:tabular-nums}
+aside a .bar{grid-column:1/3;height:4px}aside a.dim{opacity:.35}aside a.quiet{color:var(--ink2)}
+.bar{display:flex;gap:2px;height:8px;border-radius:0 4px 4px 0;overflow:hidden}.bar i{display:block;min-width:2px}
+section.host{margin-bottom:30px}
+section.host>header{display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px;margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+h2{font-size:16px;font-weight:650;margin:0}
+.meta{color:var(--ink2);font-size:13px}
+section.host>header .bar{flex:1 1 160px;max-width:320px}
+details.target{background:var(--card);border:1px solid var(--ring);border-radius:10px;padding:0 14px;margin-bottom:10px}
+details.target>summary{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:10px 0;cursor:pointer;list-style:none}
+details.target>summary::-webkit-details-marker{display:none}
+details.target>summary::before{content:"\25B8";color:var(--mute);width:10px;flex:none}
+details.target[open]>summary::before{content:"\25BE"}
+details.target>summary .url{font-weight:600}details.target>summary .bar{flex:0 0 120px;height:6px}
+details.target.quiet{background:none;border-style:dashed;margin-bottom:8px}
+details.target.quiet>summary{cursor:default;padding:7px 0}details.target.quiet>summary::before{content:"";width:0}
+details.target.quiet>summary .url{font-weight:500;color:var(--ink2)}
+table{border-collapse:collapse;width:100%;margin-bottom:10px}
+.gh th{text-align:left;font-size:12.5px;font-weight:600;color:var(--ink2);padding:12px 0 4px}
+.gh th .dot{margin-right:6px;vertical-align:1px}.gh th b{font-weight:400;color:var(--mute)}
+td{padding:3px 10px 3px 0;vertical-align:top;border-top:1px solid var(--line);word-break:break-all}
+.gh+tr td{border-top:0}
+td.n{text-align:right;white-space:nowrap;color:var(--ink2);font-variant-numeric:tabular-nums;width:1%}
+td.w{white-space:nowrap;color:var(--ink2);width:1%}td.r{color:var(--ink2)}
+section.quiet td{border-top:1px solid var(--line)}section.quiet tr:first-child td{border-top:0}
+section.quiet table{background:var(--card);border:1px solid var(--ring);border-radius:10px;padding:4px 14px}
+.hidden{display:none}
+@media(max-width:860px){.layout{grid-template-columns:1fr}aside{position:static;max-height:none}}
+""".strip()
+
+REPORT_SCRIPT = r"""
+const rows=[...document.querySelectorAll('.grp tr:not(.gh)')],grps=[...document.querySelectorAll('.grp')],
+tgts=[...document.querySelectorAll('details.target')],hosts=[...document.querySelectorAll('section.host:not(.quiet)')],
+navs=[...document.querySelectorAll('aside a[data-h]')],q=document.getElementById('q'),
+btns=[...document.querySelectorAll('nav button')];let st='';
+function apply(){const t=q.value.toLowerCase(),on=!!(st||t);
+for(const r of rows){const u=r.closest('details.target').dataset.t.toLowerCase();
+r.classList.toggle('hidden',(st&&r.dataset.s!==st)||(t&&!(u+r.textContent.toLowerCase()).includes(t)))}
+for(const g of grps)g.classList.toggle('hidden',!g.querySelector('tr:not(.gh):not(.hidden)'));
+for(const d of tgts){const live=d.classList.contains('quiet')?!st&&(!t||d.dataset.t.toLowerCase().includes(t)):!!d.querySelector('.grp:not(.hidden)');
+d.classList.toggle('hidden',!live);if(live&&on&&!d.classList.contains('quiet'))d.open=true}
+for(const h of hosts)h.classList.toggle('hidden',!h.querySelector('details.target:not(.hidden)'));
+for(const a of navs)a.classList.toggle('dim',document.getElementById(a.dataset.h).classList.contains('hidden'))}
+for(const b of btns)b.onclick=()=>{st=b.dataset.s;btns.forEach(x=>x.classList.toggle('on',x===b));apply()};
+q.oninput=apply;
+""".strip()
+
+#: Status class -> colour slot. Five fixed slots in a fixed order, validated
+#: against both surfaces with the dataviz palette checks; "?" is the
+#: muted ink, not a colour, because it is not a result.
+CLASS_OF = {2: "c2", 3: "c3", 4: "c4", 5: "c5"}
+
+
+def slot(status: int) -> str:
+    return CLASS_OF.get(status // 100, "c0") if status else "c0"
+
+
+def bar(counts: dict, extra: str = "") -> str:
+    """A stacked bar of hits by status class, segments in fixed order,
+    2px of surface between them, data end rounded."""
+    total = sum(counts.values())
+    if not total:
+        return ""
+    segments, title = [], []
+    for cls in (2, 3, 4, 5, 0):
+        n = sum(v for k, v in counts.items() if (k // 100 if k else 0) == cls)
+        if n:
+            segments.append(f'<i class="{CLASS_OF.get(cls, "c0")}" style="flex:{n}"></i>')
+            title.append(f"{cls}xx {n:,}" if cls else f"? {n:,}")
+    return (f'<div class="bar{extra}" title="{" · ".join(title)}">'
+            f'{"".join(segments)}</div>')
+
+
+def address_key(url: str) -> tuple:
+    """Sort order for targets: numeric for IPs, so .5 comes before .10
+    and the ports of one machine sit together."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    pieces = host.split(".")
+    as_ip = tuple(int(p) for p in pieces) if pieces and all(p.isdigit() for p in pieces) else ()
+    return (0 if as_ip else 1, as_ip, host, parts.port or 0, parts.scheme, url)
+
+
+def report(out: Path) -> Path:
+    """Write out/report.html and return its path.
+
+    The host is the unit, because it is what the operator thinks in: one
+    machine, its ports down the page, each port's hits grouped by status.
+    A sticky list of hosts on the left, each with a bar of what it
+    answered, is the map. Targets that found nothing go in one folded
+    table at the end rather than between the ones that did, and every
+    target says what became of its sweeps, so "nothing found" and "never
+    finished" do not read the same here either.
+    """
+    targets, sweeps, hits = gather(out)
+    esc = html.escape
+
+    by_target: dict[str, list[dict]] = {}
+    for hit in hits:
+        by_target.setdefault(hit["target"], []).append(hit)
+    by_host: dict[str, list[dict]] = {}
+    for target in targets:
+        by_host.setdefault(host_of(target["url"]), []).append(target)
+
+    counts: dict[int, int] = {}
+    for hit in hits:
+        counts[hit["status"]] = counts.get(hit["status"], 0) + 1
+    chips = [f'<button class="on" data-s="">all <b>{len(hits):,}</b></button>']
+    for status in sorted(counts):
+        chips.append(f'<button data-s="{status}"><i class="dot {slot(status)}"></i>'
+                     f'{status or "?"} <b>{counts[status]:,}</b></button>')
+    # Status 0 is a hit ffuf printed but never wrote to its JSON: every
+    # ffuf before 2.2 dropped the file when -or was given. The word
+    # survived on stdout; the status, size and type did not.
+    note = ('<p class="note">? = hit printed by ffuf but never written to its '
+            'JSON (ffuf before 2.2 with -or); status, size and type unknown. '
+            'A run with the current script records them.</p>' if 0 in counts else "")
+    tiles = "".join(f'<div class="tile"><span class="v">{v:,}</span><span class="l">{l}</span></div>'
+                    for v, l in ((len(by_host), "hosts"), (len(targets), "targets"),
+                                 (len(by_target), "targets with hits"), (len(hits), "hits")))
+
+    def came_to(url: str) -> str:
+        """One muted line on what the sweeps of a target amounted to."""
+        target = next((t for t in targets if t["url"] == url), {})
+        if target.get("skipped"):
+            return "skipped: " + target["skipped"].replace(" -- skipped", "")
+        parts = []
+        for kind in ("dirs", "files"):
+            seen = sweeps.get((url, kind))
+            if seen:
+                parts.append(f"{kind}: {seen['summary']}")
+            elif kind == "files" and (sweeps.get((url, "dirs")) or {}).get("status") in ("refused", "timeout"):
+                parts.append("files: skipped")
+        return " · ".join(parts) or "not swept"
+
+    def stack_of(url: str) -> str:
+        return next((t.get("stack") or "" for t in targets if t["url"] == url), "")
+
+    nav, sections, quiet = [], [], []
+    for host in sorted(by_host, key=lambda h: address_key(f"x://{h}")):
+        mine = sorted(by_host[host], key=lambda t: address_key(t["url"]))
+        host_hits = [h for t in mine for h in by_target.get(t["url"], [])]
+        if not host_hits:
+            quiet.extend(mine)
+            continue
+        hid = "h-" + re.sub(r"[^A-Za-z0-9]+", "-", host)
+        hcounts: dict[int, int] = {}
+        for hit in host_hits:
+            hcounts[hit["status"]] = hcounts.get(hit["status"], 0) + 1
+        nav.append(f'<a href="#{hid}" data-h="{hid}"><span class="mono">{esc(host)}</span>'
+                   f'<span class="n">{len(host_hits):,}</span>{bar(hcounts)}</a>')
+
+        cards = []
+        for target in mine:
+            url = target["url"]
+            th = by_target.get(url, [])
+            stack = stack_of(url)
+            head = (f'<a class="url mono" href="{esc(url, quote=True)}">{esc(url)}</a>'
+                    + (f'<span class="meta">{esc(stack)}</span>' if stack else ""))
+            if not th:
+                cards.append(f'<details class="target quiet" data-t="{esc(url, quote=True)}">'
+                             f'<summary>{head}<span class="meta">{esc(came_to(url))}</span></summary></details>')
+                continue
+            tcounts: dict[int, int] = {}
+            for hit in th:
+                tcounts[hit["status"]] = tcounts.get(hit["status"], 0) + 1
+            groups = []
+            for status in sorted(tcounts):
+                rows = []
+                for hit in (h for h in th if h["status"] == status):
+                    path = hit["url"][len(url):] if hit["url"].startswith(url) else hit["url"]
+                    size = f'{hit["length"]:,}' if status else ""
+                    where = f"→ {esc(hit['redirect'])}" if hit["redirect"] else ""
+                    rows.append(f'<tr data-s="{status}"><td class="mono"><a href="{esc(hit["url"], quote=True)}">'
+                                f'{esc(path or "/")}</a></td><td class="n">{size}</td>'
+                                f'<td class="w">{esc(hit["type"])}</td><td class="r mono">{where}</td></tr>')
+                # One table per target, a tbody per status: the columns line
+                # up across groups, which separate tables do not.
+                groups.append(f'<tbody class="grp" data-s="{status}"><tr class="gh"><th colspan="4">'
+                              f'<i class="dot {slot(status)}"></i>{status or "?"} <b>{len(rows):,}</b>'
+                              f'</th></tr>{"".join(rows)}</tbody>')
+            cards.append(f'<details class="target" data-t="{esc(url, quote=True)}"{" open" if len(th) <= 50 else ""}>'
+                         f'<summary>{head}<span class="meta">{len(th):,} hits</span>{bar(tcounts)}'
+                         f'<span class="meta">{esc(came_to(url))}</span></summary>'
+                         f'<table>{"".join(groups)}</table></details>')
+        sections.append(f'<section class="host" id="{hid}"><header><h2 class="mono">{esc(host)}</h2>'
+                        f'<span class="meta">{len(mine)} target{"s" if len(mine) != 1 else ""} · '
+                        f'{len(host_hits):,} hits</span>{bar(hcounts)}</header>{"".join(cards)}</section>')
+
+    if quiet:
+        nav.append(f'<a href="#quiet" class="quiet"><span>nothing found</span><span class="n">{len(quiet)}</span></a>')
+        rows = "".join(f'<tr><td class="mono"><a href="{esc(t["url"], quote=True)}">{esc(t["url"])}</a></td>'
+                       f'<td class="w">{esc(t.get("stack") or "")}</td><td class="r">{esc(came_to(t["url"]))}</td></tr>'
+                       for t in sorted(quiet, key=lambda t: address_key(t["url"])))
+        sections.append(f'<section class="host quiet" id="quiet"><header><h2>Nothing found</h2>'
+                        f'<span class="meta">{len(quiet)} targets, and what became of each</span></header>'
+                        f'<table>{rows}</table></section>')
+
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>smart-fuzz · {esc(out.name)}</title>
+<style>{REPORT_STYLE}</style></head><body>
+<header class="top"><div class="brand">smart-fuzz · {time.strftime('%Y-%m-%d %H:%M')}</div>
+<h1>{esc(out.name)}</h1>
+<div class="tiles">{tiles}</div>
+<nav>{"".join(chips)}<input type="search" id="q" placeholder="filter paths, hosts"></nav>{note}
+</header>
+<div class="layout"><aside><p class="hd">Hosts</p>{"".join(nav)}</aside>
+<main>{"".join(sections) or '<p class="meta">no targets</p>'}</main></div>
+<script>{REPORT_SCRIPT}</script>
+</body></html>
+"""
+    path = out / "report.html"
+    path.write_text(page, encoding="utf-8")
+    return path
 
 
 def _by_host(plan: list) -> dict:
@@ -663,7 +1119,12 @@ def _by_host(plan: list) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("urls", type=Path, help="httpx output, one URL per line")
+    parser.add_argument("urls", type=Path, nargs="?",
+                        help="httpx output, one URL per line")
+    parser.add_argument("--generate", type=Path, metavar="DIR",
+                        help="build DIR/report.html from an output directory "
+                             "that already exists, finished or still running, "
+                             "and exit. Sends nothing")
     parser.add_argument("--wordlists", type=Path, default=CACHE,
                         help=f"where the lists live; downloaded on first run "
                              f"(default: {CACHE})")
@@ -695,6 +1156,13 @@ def main() -> int:
                         help="fingerprint and print the commands, send nothing")
     args = parser.parse_args()
 
+    if args.generate:
+        if not args.generate.is_dir():
+            return print(f"can't find {args.generate}") or 2
+        print(f"[*] report at {report(args.generate)}")
+        return 0
+    if args.urls is None:
+        parser.error("urls is required unless --generate is given")
     if not args.dry_run and shutil.which("ffuf") is None:
         return print("ffuf is not on PATH") or 1
     if not args.urls.is_file():
@@ -742,8 +1210,12 @@ def main() -> int:
     by_stack: dict[frozenset, Path] = {}
     plan = []
     slowest: dict[str, float] = {}
+    journal = Journal(None if args.dry_run else out / "run.jsonl")
     for target in seen:
         url, label, latency = target.url, target.label, target.latency
+        journal.add(event="target", url=url, slug=slug_of(url),
+                    stack="" if label == "unreachable" else label,
+                    skipped=target.why)
         if label == "unreachable":
             # The fingerprint is this tool's own evidence. Sweeping a URL it
             # could not reach costs ninety seconds to learn the same thing,
@@ -801,11 +1273,23 @@ def main() -> int:
                                   out / "lists", args.dry_run)
         if rate == 0:
             say(f"    {host}  {why} -- skipped")
+            journal.add(event="host", host=host, note=f"{why} -- skipped",
+                        skipped=True)
             return
         if rate != guess:
             say(f"    {host}  settled at {rate}/s (asked for {guess}/s)")
+            journal.add(event="host", host=host, note=f"settled at {rate}/s")
 
-        def attempt(url: str, wordlist: Path, into: Path, label: str) -> Outcome:
+        def run(url: str, wordlist: Path, into: Path, kind: str) -> Outcome:
+            result = sweep(url, wordlist, into, rate, args.threads,
+                           args.maxtime, args.dry_run, f"{kind}: ")
+            say(f"    {url}  {result.summary}")
+            journal.add(event="sweep", url=url, kind=kind, rate=rate,
+                        status=result.status, hits=result.hits,
+                        summary=result.summary[len(kind) + 2:])
+            return result
+
+        def attempt(url: str, wordlist: Path, into: Path, kind: str) -> Outcome:
             # A refused sweep is the host saying "less", in the only way it
             # can. Halve, run this one again, and keep the lower rate for
             # the rest of the host. The printer whose https ports fell
@@ -813,15 +1297,12 @@ def main() -> int:
             # was told "lower --rate" twice and swept at the same rate
             # both times; the one with the number is this script.
             nonlocal rate
-            result = sweep(url, wordlist, into, rate, args.threads,
-                           args.maxtime, args.dry_run, label)
-            say(f"    {url}  {result.summary}")
+            result = run(url, wordlist, into, kind)
             if result.status == "refused" and rate // 2 >= RATE_FLOOR:
                 rate //= 2
                 say(f"    {host}  dropping to {rate}/s for the rest of this host")
-                result = sweep(url, wordlist, into, rate, args.threads,
-                               args.maxtime, args.dry_run, label)
-                say(f"    {url}  {result.summary}")
+                journal.add(event="host", host=host, note=f"dropping to {rate}/s")
+                result = run(url, wordlist, into, kind)
             if result.status == "refused":
                 rate //= 2
             return result
@@ -832,22 +1313,26 @@ def main() -> int:
                 done[0] += 1
                 position = done[0]
             say(f"[*] {position}/{len(plan)}  {url}")
-            dirs = attempt(url, base, out / f"{slug}-dirs.json", "dirs: ")
+            dirs = attempt(url, base, out / f"{slug}-dirs.json", "dirs")
             if dirs.status in ("refused", "timeout"):
                 # The file sweep is the same host at the same rate, and
                 # sending it would be the same answer a second time.
                 say(f"    {url}  skipping the file sweep")
             elif extras is not None:
-                attempt(url, extras, out / f"{slug}-files.json", "files: ")
+                attempt(url, extras, out / f"{slug}-files.json", "files")
             if rate < RATE_FLOOR:
-                say(f"    {host}  refuses even {RATE_FLOOR}/s -- "
-                    f"skipping the rest of this host")
+                note = f"refuses even {RATE_FLOOR}/s -- skipping the rest of this host"
+                say(f"    {host}  {note}")
+                journal.add(event="host", host=host, note=note, skipped=True)
                 return
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(work, list(by_host)))
 
-    print(f"[*] done. results in {out}/")
+    if args.dry_run:
+        print(f"[*] done. nothing sent; commands above")
+        return 0
+    print(f"[*] done. results in {out}/, report at {report(out)}")
     return 0
 
 

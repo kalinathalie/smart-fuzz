@@ -79,6 +79,8 @@ python3 smart-fuzz.py urls.txt [options]
   --keep-case    do not fold /Admin into /admin
   --wordlists D  use lists from D instead of downloading
   --out D        where results go (default: fuzz-<timestamp>/)
+  --generate D   build D/report.html from an output directory that already
+                 exists, finished or still running, and exit. Sends nothing.
 ```
 
 `urls.txt` is `httpx` output: one absolute URL per line, scheme and port
@@ -150,6 +152,8 @@ terms elsewhere.
 
 ```
 fuzz-20260101-120000/
+  report.html           start here
+  run.jsonl             what the terminal was told, one line each
   lists/
     base.txt            the merged directory list, built once
     extras-0.txt        one per distinct stack, not per target
@@ -160,8 +164,28 @@ fuzz-20260101-120000/
   http_10.0.0.20_8080-files.log
 ```
 
-ffuf's own JSON, one file per sweep; nothing is written for a sweep that
-found nothing. The `.log` is what ffuf said on the way out, which is how
+**`report.html`** is one page with nothing fetched from anywhere, so it
+opens on the box the scan ran from. The host is the unit: a sticky list
+of hosts on the left, each with a bar of what it answered by status
+class, and down the page one section per host with its ports as cards,
+each card's hits grouped by status code with size, type and redirect.
+The status counts at the top filter everything, and so does the search
+box. Every card says what became of its sweeps, so `nothing found` and
+`never finished` do not read the same there either, and the targets that
+found nothing sit in one table at the end rather than between the ones
+that did. A host that answers everything is summarised as `catch-all:
+123,556 of 176,699 words answered` rather than listed, because listing it
+would be listing the wordlist.
+
+`--generate DIR` builds the report again from a directory that already
+exists, including one written before the report did. The `run.jsonl` is
+the journal it is built from; without one, the same is pieced together
+from the files below. Hits from a run made with ffuf older than 2.2 come
+back with status `?`: that ffuf printed each hit and then, given `-or`,
+never wrote the JSON. The words survived on stdout in the `.log`; the
+status codes did not. `-or` is no longer passed for that reason.
+
+The rest is evidence. ffuf's own JSON, one file per sweep. The `.log` is what ffuf said on the way out, which is how
 you tell a cut sweep from a finished one after the fact. The `.errors` is
 one line per failed request with the reason, kept only when something
 failed -- it is the evidence behind `refused` and `no answer`, and the
